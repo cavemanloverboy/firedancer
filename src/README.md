@@ -1,0 +1,75 @@
+# Firedancer source tree
+
+```txt
+  firedancer/
+  │
+  ├── .github/         GitHub CI configuration
+  │
+  ├── build/                   Build artifacts
+  │   └── linux/gcc/x86_64     Build profile
+  │       ├── bin/             Main programs and scripts
+  │       ├── cov/             Coverage report
+  │       ├── include/         Exported include headers
+  │       ├─  lib/             Static libraries
+  │       ├── obj/             Object files of individual compile units
+  │       └── unit-test/       Test binaries
+  │
+  ├── config/          GNU Make configuration
+  │
+  ├── contrib/         Miscellaneous developer tooling
+  │   ├── codegen/     Scripts used to generate code
+  │   ├── docker/      Reference container configuration
+  │   ├── test/        Scripts used to run tests
+  │   └── tool/        Config files for developer tools
+  │
+  ├── opt/
+  │   ├── git/         Third-party dependency repos
+  │   ├── include/     Third-party dependency headers
+  │   └── lib/         Third-party dependency libraries
+  │
+  ├── src/             The main Firedancer source tree
+  │   │
+  │   ├── app/         Main binaries
+  │   │
+  │   ├── ballet/      Standalone implementations of various standards
+  │   │                needed for interoperability with the Solana ecosystem
+  │   │                (hash functions, cryptographic algorithms)
+  │   │
+  |   ├── choreo/      Consensus components (fork choice, voting)
+  │   │
+  │   ├── disco/       Tiles running on the tango messaging layer
+  │   │
+  │   ├── flamenco/    Major Solana runtime components
+  │   │
+  │   ├── funk/        Database optimized for storing Solana ledger and
+  │   │                accounts
+  │   │
+  │   ├── tango/       IPC messaging layer
+  │   │
+  │   ├── util/        C language environment, system runtime, common data
+  │   │                structures and various utilities (math, bits, rng ...)
+  │   │
+  │   └── waltz/       Networking
+  │
+  └── verification/    CBMC-based code verification system
+```
+
+## Important files
+
+```txt
+  README.md
+
+  # Prepare external dependencies
+  deps.sh
+
+  # Test launchers
+  contrib/test/run_unit_tests.sh
+  contrib/test/run_script_tests.sh
+  contrib/test/run_integration_tests.sh
+
+  # All-in-one test launcher
+  contrib/test/ci_tests.sh
+
+  # Licensing information for imported third-party code
+  NOTICE
+```
