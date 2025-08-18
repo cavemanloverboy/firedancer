@@ -479,7 +479,7 @@ typedef struct fd_pack_penalty_treap fd_pack_penalty_treap_t;
    until slot 3.  The main reason this is not 1 is that some skips that
    seem permanent until the end of the slot can actually go away based
    on rebates. */
-#define FD_PACK_SKIP_CNT 5UL
+#define FD_PACK_SKIP_CNT 100UL
 
 /* Finally, we can now declare the main pack data structure */
 struct fd_pack_private {
@@ -2266,15 +2266,52 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
 
   fd_pack_addr_use_t   null_use[1]    = {{{{ 0 }}, { 0 }}};
 
-  while( !(doesnt_fit | has_conflict) & !treap_rev_iter_done( _cur ) ) {
+#define CONTINUE  { _cur = treap_rev_iter_next( _cur, pool ); continue; }
+
+  while( !treap_rev_iter_done( _cur ) ) {
     fd_pack_ord_txn_t * cur = treap_rev_iter_ele( _cur, pool );
     ulong this_bundle_idx = RC_TO_REL_BUNDLE_IDX( cur->rewards, cur->compute_est );
-    if( FD_UNLIKELY( this_bundle_idx!=bundle_idx ) ) break;
+    if( FD_UNLIKELY( this_bundle_idx!=bundle_idx ) ) {
+      /* valid bundle? */
+      if( !(doesnt_fit | has_conflict) ) break;
+      
+      // reset bundle start, metadata
+      _txn0 = _cur;
+      txn0 = cur;
+      bundle_idx = this_bundle_idx;
+      is_ib = !!(txn0->txn->flags & FD_TXN_P_FLAGS_INITIALIZER_BUNDLE);
+      
+      // reset limits
+      cu_limit         = pack->lim->max_cost_per_block        - pack->cumulative_block_cost;
+      byte_limit       = pack->lim->max_data_bytes_per_block  - pack->data_bytes_consumed;
+      microblock_limit = pack->lim->max_microblocks_per_block - pack->microblock_cnt;
+
+      // reset trackers
+      doesnt_fit   = 0;
+      has_conflict = 0;
+
+      // reset counter
+      txn_cnt = 0;
+
+      // Clean up bundle_temp_map from previous bundle attempt
+      for( ulong i=0UL; i<bundle_temp_inserted_cnt; i++ ) {
+        acct_uses_remove( pack->bundle_temp_map, bundle_temp_inserted[ bundle_temp_inserted_cnt-i-1UL ] );
+      }
+      bundle_temp_inserted_cnt = 0;
+
+      // reset locks
+      FD_PACK_BITSET_COPY( bitset_rw_in_use, pack->bitset_rw_in_use );
+      FD_PACK_BITSET_COPY( bitset_w_in_use,  pack->bitset_w_in_use  );
+
+      memset( last_use_in_txn_cnt, 0, sizeof(last_use_in_txn_cnt) );
+    } else if( doesnt_fit | has_conflict ){
+      CONTINUE;
+    }
 
     if( FD_UNLIKELY( cur->compute_est>cu_limit ) ) {
       doesnt_fit = 1;
       FD_MCNT_INC( PACK, TRANSACTION_SCHEDULE_CU_LIMIT,   1UL );
-      break;
+      CONTINUE;
     }
     cu_limit -= cur->compute_est;
 
@@ -2282,21 +2319,25 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
     if( FD_UNLIKELY( microblock_limit==0UL ) ) {
       doesnt_fit = 1;
       FD_MCNT_INC( PACK, MICROBLOCK_PER_BLOCK_LIMIT, 1UL );
-      break;
+      /* 
+        cavey: we don't want to keep iterating through bundles if we simply filled the block...
+        txn_cnt is incremented at END of loop so if this is the first txn in a bundle it will be 0
+      */
+      if( FD_LIKELY( txn_cnt==0 ) ) { break; } else { CONTINUE; };
     }
     microblock_limit--;
 
     if( FD_UNLIKELY( cur->txn->payload_sz+MICROBLOCK_DATA_OVERHEAD>byte_limit ) ) {
       doesnt_fit = 1;
       FD_MCNT_INC( PACK, TRANSACTION_SCHEDULE_BYTE_LIMIT, 1UL );
-      break;
+      CONTINUE;
     }
     byte_limit -= cur->txn->payload_sz + MICROBLOCK_DATA_OVERHEAD;
 
     if( FD_UNLIKELY( !FD_PACK_BITSET_INTERSECT4_EMPTY( pack->bitset_rw_in_use, pack->bitset_w_in_use, cur->w_bitset, cur->rw_bitset ) ) ) {
       has_conflict = 1;
       FD_MCNT_INC( PACK, TRANSACTION_SCHEDULE_FAST_PATH,  1UL );
-      break;
+      CONTINUE;
     }
 
     /* Don't update the actual in-use bitset, because the transactions
@@ -2342,7 +2383,7 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
         break;
       }
     }
-    if( has_conflict | doesnt_fit ) break;
+    if( has_conflict | doesnt_fit ) CONTINUE;
 
     /* Check conflicts between this transaction's readonly accounts and
        current writers */
@@ -2370,11 +2411,12 @@ fd_pack_try_schedule_bundle( fd_pack_t  * pack,
       }
     }
 
-    if( has_conflict | doesnt_fit ) break;
+    if( has_conflict | doesnt_fit ) CONTINUE;
 
     txn_cnt++;
     _cur = treap_rev_iter_next( _cur, pool );
   }
+#undef CONTINUE
   int retval = fd_int_if( doesnt_fit, TRY_BUNDLE_DOES_NOT_FIT,
                                       fd_int_if( has_conflict, TRY_BUNDLE_HAS_CONFLICTS, TRY_BUNDLE_SUCCESS( (int)txn_cnt ) ) );
 
