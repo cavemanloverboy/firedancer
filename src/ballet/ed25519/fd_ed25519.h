@@ -119,7 +119,15 @@ fd_ed25519_verify( uchar const   msg[], /* msg_sz */
    batch_sz is the size of signatures, pubkeys and shas.
    batch_sz must be greater than zero.
 
-   See fd_ed25519_verify for more details. */
+   See fd_ed25519_verify for more details.
+
+   Note this shares the message but not the curve work: it is a loop over
+   per-signature scalar multiplications, so its cost per signature is the
+   same as fd_ed25519_verify's.  When there are eight or more independent
+   signatures available AND AVX-512 is present, fd_ed25519_verify_batch_x8
+   in avx512/fd_ed25519_x8.h instead runs one signature per SIMD lane and
+   is about 3x faster per signature.  It takes per-signature messages, so it
+   is not restricted to the shared-message case. */
 
 int
 fd_ed25519_verify_batch_single_msg( uchar const   msg[], /* msg_sz */
