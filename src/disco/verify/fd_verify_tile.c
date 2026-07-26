@@ -4,6 +4,10 @@
 #include "generated/fd_verify_tile_seccomp.h"
 #include "../../flamenco/gossip/fd_gossip_message.h"
 
+#if FD_BATCH_VERIFY
+#include "../../ballet/ed25519/avx512/fd_ed25519_x8.h"
+#endif
+
 #define IN_KIND_QUIC   (0UL)
 #define IN_KIND_BUNDLE (1UL)
 #define IN_KIND_GOSSIP (2UL)
@@ -27,8 +31,10 @@ scratch_footprint( fd_topo_tile_t const * tile ) {
 
 static inline void
 metrics_write( fd_verify_ctx_t * ctx ) {
-  FD_MCNT_ENUM_COPY( VERIFY, TXN_RESULT, ctx->metrics.verify_tile_result );
-  FD_MCNT_SET( VERIFY, VOTE_GOSSIP_RX,  ctx->metrics.gossiped_votes_cnt );
+  FD_MCNT_ENUM_COPY( VERIFY, TXN_RESULT,    ctx->metrics.verify_tile_result );
+  FD_MCNT_SET      ( VERIFY, VOTE_GOSSIP_RX, ctx->metrics.gossiped_votes_cnt );
+  FD_MCNT_ENUM_COPY( VERIFY, BATCH_TXN_CNT, ctx->metrics.batch_txn_cnt );
+  FD_MCNT_ENUM_COPY( VERIFY, BATCH_SIG_CNT, ctx->metrics.batch_sig_cnt );
 }
 
 static int
@@ -36,6 +42,11 @@ before_frag( fd_verify_ctx_t * ctx,
              ulong             in_idx,
              ulong             seq,
              ulong             sig ) {
+#if FD_BATCH_VERIFY
+  /* Producer still ahead on this in (keep or RR skip). */
+  ctx->saw_frag[ in_idx ] = 1;
+#endif
+
   /* Bundle tile can produce both "bundles" and "packets", a packet is a
      regular transaction and should be round-robined between verify
      tiles, while bundles need to go through verify:0 currently to
@@ -89,6 +100,195 @@ during_frag( fd_verify_ctx_t * ctx,
     fd_memcpy( fd_txn_m_payload( dst ), msg->vote->value->transaction, msg->vote->value->transaction_len );
   }
 }
+
+#if FD_BATCH_VERIFY
+
+static void
+flush_batch( fd_verify_ctx_t *   ctx,
+             fd_stem_context_t * stem ) {
+  ulong batch_cnt = ctx->batch_cnt;
+  if( FD_UNLIKELY( !batch_cnt ) ) return;
+
+  uchar const * msgs   [ FD_VERIFY_BATCH_MAX * FD_TXN_ACTUAL_SIG_MAX ];
+  ulong         msg_sz [ FD_VERIFY_BATCH_MAX * FD_TXN_ACTUAL_SIG_MAX ];
+  uchar const * sigs   [ FD_VERIFY_BATCH_MAX * FD_TXN_ACTUAL_SIG_MAX ];
+  uchar const * pubs   [ FD_VERIFY_BATCH_MAX * FD_TXN_ACTUAL_SIG_MAX ];
+  int           ok     [ FD_VERIFY_BATCH_MAX * FD_TXN_ACTUAL_SIG_MAX ];
+  ulong         sig_off[ FD_VERIFY_BATCH_MAX + 1UL ];
+
+  ulong lane_cnt = 0UL;
+  sig_off[ 0 ] = 0UL;
+  for( ulong i=0UL; i<batch_cnt; i++ ) {
+    fd_verify_batch_slot_t const * s = &ctx->batch[ i ];
+    for( ulong j=0UL; j<(ulong)s->sig_cnt; j++ ) {
+      msgs  [ lane_cnt ] = s->msg;
+      msg_sz[ lane_cnt ] = s->msg_sz;
+      sigs  [ lane_cnt ] = s->signatures + j*FD_TXN_SIGNATURE_SZ;
+      pubs  [ lane_cnt ] = s->pubkeys    + j*FD_TXN_ACCT_ADDR_SZ;
+      lane_cnt++;
+    }
+    sig_off[ i+1UL ] = lane_cnt;
+  }
+
+  fd_ed25519_verify_batch_x8( msgs, msg_sz, sigs, pubs, ok, lane_cnt );
+
+  /* Flush-size histograms: index = size-1.  Sig lanes saturate at 8. */
+  ctx->metrics.batch_txn_cnt[ batch_cnt - 1UL ]++;
+  ctx->metrics.batch_sig_cnt[ fd_ulong_min( lane_cnt, FD_VERIFY_BATCH_MAX ) - 1UL ]++;
+
+  for( ulong i=0UL; i<batch_cnt; i++ ) {
+    fd_verify_batch_slot_t const * s = &ctx->batch[ i ];
+    int txn_ok = 1;
+    for( ulong j=sig_off[ i ]; j<sig_off[ i+1UL ]; j++ ) {
+      if( FD_UNLIKELY( ok[ j ]!=FD_ED25519_SUCCESS ) ) { txn_ok = 0; break; }
+    }
+
+    if( FD_UNLIKELY( !txn_ok ) ) {
+      if( FD_UNLIKELY( s->is_bundle ) ) ctx->bundle_failed = 1;
+      ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_VERIFY_FAILURE_IDX ]++;
+      continue;
+    }
+
+    if( FD_LIKELY( s->dedup ) ) {
+      int ha_dup = 0;
+      FD_TCACHE_INSERT( ha_dup, *ctx->tcache_sync, ctx->tcache_ring, ctx->tcache_depth, ctx->tcache_map, ctx->tcache_map_cnt, s->ha_dedup_tag );
+      if( FD_UNLIKELY( ha_dup ) ) {
+        ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_DEDUP_FAILURE_IDX ]++;
+        continue;
+      }
+    }
+
+    ulong tspub = (ulong)fd_frag_meta_ts_comp( fd_tickcount() );
+    fd_stem_publish( stem, 0UL, 0UL, s->out_chunk, s->realized_sz, 0UL, s->tsorig, tspub );
+    ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_SUCCESS_IDX ]++;
+  }
+
+  ctx->batch_cnt = 0UL;
+}
+
+/* stage_txn reserves the current out_chunk into the batch.  Caller
+   must have already parsed and HA-dedup-queried the txn. */
+
+static void
+stage_txn( fd_verify_ctx_t * ctx,
+           fd_txn_m_t *      txnm,
+           fd_txn_t const *  txnt,
+           int               is_bundle,
+           int               dedup,
+           ulong             ha_dedup_tag,
+           ulong             tsorig ) {
+  uchar const * payload = fd_txn_m_payload_const( txnm );
+  fd_verify_batch_slot_t * s = &ctx->batch[ ctx->batch_cnt++ ];
+  s->out_chunk    = ctx->out_chunk;
+  s->realized_sz  = fd_txn_m_realized_footprint( txnm, 1, 0 );
+  s->tsorig       = tsorig;
+  s->ha_dedup_tag = ha_dedup_tag;
+  s->is_bundle    = is_bundle;
+  s->dedup        = dedup;
+  s->sig_cnt      = txnt->signature_cnt;
+  s->msg          = payload + txnt->message_off;
+  s->msg_sz       = (ulong)txnm->payload_sz - (ulong)txnt->message_off;
+  s->signatures   = payload + txnt->signature_off;
+  s->pubkeys      = payload + txnt->acct_addr_off;
+
+  ctx->out_chunk = fd_dcache_compact_next( ctx->out_chunk, s->realized_sz, ctx->out_chunk0, ctx->out_wmark );
+}
+
+static inline void
+after_poll_idle_batch( fd_verify_ctx_t * ctx,
+                       ulong             in_idx ) {
+  ctx->saw_frag[ in_idx ] = 0;
+}
+
+/* after_credit_batch: sigverify + publish when the batch's in is idle.
+   Other ins going idle do not clear saw_frag[batch_in_idx]. */
+
+static void
+after_credit_batch( fd_verify_ctx_t *   ctx,
+                    fd_stem_context_t * stem,
+                    int *               opt_poll_in FD_PARAM_UNUSED,
+                    int *               charge_busy ) {
+  if( FD_LIKELY( ctx->batch_cnt ) && FD_LIKELY( !ctx->saw_frag[ ctx->batch_in_idx ] ) ) {
+    flush_batch( ctx, stem );
+    *charge_busy = 1;
+  }
+}
+
+static void
+after_frag_batch( fd_verify_ctx_t *   ctx,
+                  ulong               in_idx,
+                  ulong               seq,
+                  ulong               sig,
+                  ulong               sz,
+                  ulong               tsorig,
+                  ulong               _tspub,
+                  fd_stem_context_t * stem ) {
+  (void)seq;
+  (void)sig;
+  (void)sz;
+  (void)_tspub;
+
+  if( FD_UNLIKELY( ctx->in_kind[ in_idx ]==IN_KIND_GOSSIP || ctx->in_kind[ in_idx ]==IN_KIND_TXSEND ) ) ctx->metrics.gossiped_votes_cnt++;
+
+  fd_txn_m_t * txnm = (fd_txn_m_t *)fd_chunk_to_laddr( ctx->out_mem, ctx->out_chunk );
+  if( FD_UNLIKELY( txnm->payload_sz>FD_TPU_MTU ) ) {
+    FD_LOG_ERR(( "verify: txn payload size %hu exceeds max %lu", txnm->payload_sz, FD_TPU_MTU ));
+  }
+  fd_txn_t * txnt = fd_txn_m_txn_t( txnm );
+  txnm->txn_t_sz = (ushort)fd_txn_parse( fd_txn_m_payload( txnm ), txnm->payload_sz, txnt, NULL );
+
+  int is_bundle = !!txnm->block_engine.bundle_id;
+
+  if( FD_UNLIKELY( is_bundle & (txnm->block_engine.bundle_id!=ctx->bundle_id) ) ) {
+    ctx->bundle_failed = 0;
+    ctx->bundle_id     = txnm->block_engine.bundle_id;
+  }
+
+  if( FD_UNLIKELY( is_bundle & (!!ctx->bundle_failed) ) ) {
+    ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_BUNDLE_PEER_FAILURE_IDX ]++;
+    return;
+  }
+
+  if( FD_UNLIKELY( !txnm->txn_t_sz ) ) {
+    if( FD_UNLIKELY( is_bundle ) ) ctx->bundle_failed = 1;
+    ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_PARSE_FAILURE_IDX ]++;
+    return;
+  }
+
+  int dedup = !is_bundle;
+  uchar const * signatures = fd_txn_m_payload_const( txnm ) + txnt->signature_off;
+  ulong ha_dedup_tag = fd_hash( ctx->hashmap_seed, signatures, 64UL );
+  if( FD_LIKELY( dedup ) ) {
+    int ha_dup = 0;
+    FD_FN_UNUSED ulong tcache_map_idx = 0;
+    FD_TCACHE_QUERY( ha_dup, tcache_map_idx, ctx->tcache_map, ctx->tcache_map_cnt, ha_dedup_tag );
+    if( FD_UNLIKELY( ha_dup ) ) {
+      ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_DEDUP_FAILURE_IDX ]++;
+      return;
+    }
+  }
+
+  /* Bundles must not share a verify batch with other txns (peer-failure
+     accounting).  Invariant on entry: batch_cnt < FD_VERIFY_BATCH_MAX,
+     so flush + one bundle publish stays within STEM_BURST. */
+  if( FD_UNLIKELY( is_bundle ) ) {
+    flush_batch( ctx, stem );
+    stage_txn( ctx, txnm, txnt, 1, 0, ha_dedup_tag, tsorig );
+    flush_batch( ctx, stem );
+    return;
+  }
+
+  /* Copy already landed in out dcache during_frag.  Stage metadata and
+     leave sigverify+publish for after_credit (or when full). */
+  stage_txn( ctx, txnm, txnt, 0, dedup, ha_dedup_tag, tsorig );
+  ctx->batch_in_idx = in_idx;
+
+  if( FD_UNLIKELY( ctx->batch_cnt==FD_VERIFY_BATCH_MAX ) ) {
+    flush_batch( ctx, stem );
+  }
+}
+
+#else /* !FD_BATCH_VERIFY */
 
 static inline void
 after_frag( fd_verify_ctx_t *   ctx,
@@ -157,6 +357,8 @@ after_frag( fd_verify_ctx_t *   ctx,
   ctx->metrics.verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_V_SUCCESS_IDX ]++;
 }
 
+#endif /* FD_BATCH_VERIFY */
+
 static void
 privileged_init( fd_topo_t const *      topo,
                  fd_topo_tile_t const * tile ) {
@@ -190,6 +392,12 @@ unprivileged_init( fd_topo_t const *      topo,
   ctx->bundle_id     = 0UL;
 
   memset( &ctx->metrics, 0, sizeof( ctx->metrics ) );
+
+#if FD_BATCH_VERIFY
+  ctx->batch_cnt    = 0UL;
+  ctx->batch_in_idx = 0UL;
+  fd_memset( ctx->saw_frag, 0, sizeof( ctx->saw_frag ) );
+#endif
 
   ctx->tcache_depth   = fd_tcache_depth       ( tcache );
   ctx->tcache_map_cnt = fd_tcache_map_cnt     ( tcache );
@@ -251,7 +459,11 @@ populate_allowed_fds( fd_topo_t const *      topo,
   return out_cnt;
 }
 
+#if FD_BATCH_VERIFY
+#define STEM_BURST (FD_VERIFY_BATCH_MAX)
+#else
 #define STEM_BURST (1UL)
+#endif
 
 #define STEM_CALLBACK_CONTEXT_TYPE  fd_verify_ctx_t
 #define STEM_CALLBACK_CONTEXT_ALIGN alignof(fd_verify_ctx_t)
@@ -259,7 +471,14 @@ populate_allowed_fds( fd_topo_t const *      topo,
 #define STEM_CALLBACK_METRICS_WRITE metrics_write
 #define STEM_CALLBACK_BEFORE_FRAG   before_frag
 #define STEM_CALLBACK_DURING_FRAG   during_frag
+
+#if FD_BATCH_VERIFY
+#define STEM_CALLBACK_AFTER_CREDIT     after_credit_batch
+#define STEM_CALLBACK_AFTER_POLL_IDLE  after_poll_idle_batch
+#define STEM_CALLBACK_AFTER_FRAG       after_frag_batch
+#else
 #define STEM_CALLBACK_AFTER_FRAG    after_frag
+#endif
 
 #include "../stem/fd_stem.c"
 

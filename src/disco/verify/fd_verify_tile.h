@@ -8,6 +8,22 @@
 #include "../topo/fd_topo.h"
 #include "../metrics/generated/fd_metrics_enums.h"
 
+/* FD_BATCH_VERIFY enables cross-transaction signature batching via
+   fd_ed25519_verify_batch_x8.  Requires AVX-512.  When disabled (the
+   default), the tile verifies one transaction at a time with
+   fd_ed25519_verify_batch_single_msg. */
+
+#ifndef FD_BATCH_VERIFY
+#define FD_BATCH_VERIFY 0
+#endif
+
+#if FD_BATCH_VERIFY
+# if !FD_HAS_AVX512
+#   error "FD_BATCH_VERIFY requires FD_HAS_AVX512"
+# endif
+# define FD_VERIFY_BATCH_MAX (8UL)
+#endif
+
 #define FD_TXN_VERIFY_SUCCESS  0
 #define FD_TXN_VERIFY_FAILED  -1
 #define FD_TXN_VERIFY_DEDUP   -2
@@ -22,6 +38,24 @@ typedef struct {
   ulong       chunk0;
   ulong       wmark;
 } fd_verify_in_ctx_t;
+
+#if FD_BATCH_VERIFY
+/* Staged transaction waiting for a batched verify.  Payload lives in
+   the out dcache at out_chunk; pointers below alias into that slot. */
+typedef struct {
+  ulong         out_chunk;
+  ulong         realized_sz;
+  ulong         tsorig;
+  ulong         ha_dedup_tag;
+  int           is_bundle;
+  int           dedup;
+  uchar         sig_cnt;
+  uchar const * msg;
+  ulong         msg_sz;
+  uchar const * signatures; /* sig_cnt * 64 */
+  uchar const * pubkeys;    /* sig_cnt * 32 */
+} fd_verify_batch_slot_t;
+#endif
 
 typedef struct {
   /* TODO switch to fd_sha512_batch_t? */
@@ -49,9 +83,25 @@ typedef struct {
 
   ulong       hashmap_seed;
 
+#if FD_BATCH_VERIFY
+  fd_verify_batch_slot_t batch[ FD_VERIFY_BATCH_MAX ];
+  ulong                  batch_cnt;
+  /* Per-in producer activity.  before_frag sets saw_frag[in]=1 (keep or
+     RR skip); AFTER_POLL_IDLE sets saw_frag[in]=0 when that in is
+     caught up.  after_credit flushes only when !saw_frag[batch_in_idx],
+     so empty polls on other ins do not end a quic batch. */
+  int                    saw_frag[ 32 ];
+  ulong                  batch_in_idx;
+#endif
+
   struct {
     ulong verify_tile_result[ FD_METRICS_ENUM_VERIFY_TILE_RESULT_CNT ];
     ulong gossiped_votes_cnt;
+    /* FD_BATCH_VERIFY flush-size histograms (index = size-1).  Zero
+       when batching is disabled.  batch_sig_cnt[7] counts flushes with
+       8 or more signature lanes. */
+    ulong batch_txn_cnt[ FD_METRICS_ENUM_VERIFY_BATCH_SIZE_CNT ];
+    ulong batch_sig_cnt[ FD_METRICS_ENUM_VERIFY_BATCH_SIZE_CNT ];
   } metrics;
 } fd_verify_ctx_t;
 

@@ -163,7 +163,13 @@
       AFTER_POLL_OVERRUN
    Is called when an overrun is detected while polling for new frags.
    This callback is not called when an overrun is detected in
-   during_frag. */
+   during_frag.
+
+      AFTER_POLL_IDLE
+   Is called when stem polls an in and finds it caught up (no new frag).
+   in_idx is the stem in index that was polled.  before_frag is not
+   invoked in this case.  Useful for per-in idle tracking (e.g. batching
+   until a specific producer drains). */
 
 #include "../../util/log/fd_log.h"
 #include "../topo/fd_topo.h"
@@ -645,6 +651,10 @@ STEM_(run1)( ulong                        in_cnt,
 #ifdef STEM_CALLBACK_AFTER_POLL_OVERRUN
         STEM_CALLBACK_AFTER_POLL_OVERRUN( ctx );
 #endif
+      } else {
+#ifdef STEM_CALLBACK_AFTER_POLL_IDLE
+        STEM_CALLBACK_AFTER_POLL_IDLE( ctx, (ulong)this_in->idx );
+#endif
       }
 
       /* Don't bother with spin as polling multiple locations */
@@ -878,3 +888,4 @@ STEM_(run)( fd_topo_t *      topo,
 #undef STEM_CALLBACK_RETURNABLE_FRAG
 #undef STEM_CALLBACK_AFTER_FRAG
 #undef STEM_CALLBACK_AFTER_POLL_OVERRUN
+#undef STEM_CALLBACK_AFTER_POLL_IDLE

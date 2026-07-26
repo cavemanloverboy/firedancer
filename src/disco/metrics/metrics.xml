@@ -725,9 +725,25 @@ EXAMPLES
     <int value="4" name="VerifyFailure" label="Transaction failed signature verification" />
 </enum>
 
+<!-- Histogram buckets for FD_BATCH_VERIFY flush sizes.  Indices are
+     size-1 (Size1..Size8).  For BatchSigCnt, Size8 means "8 or more"
+     signature lanes. -->
+<enum name="VerifyBatchSize">
+    <int value="0" name="Size1" label="Batch of 1" />
+    <int value="1" name="Size2" label="Batch of 2" />
+    <int value="2" name="Size3" label="Batch of 3" />
+    <int value="3" name="Size4" label="Batch of 4" />
+    <int value="4" name="Size5" label="Batch of 5" />
+    <int value="5" name="Size6" label="Batch of 6" />
+    <int value="6" name="Size7" label="Batch of 7" />
+    <int value="7" name="Size8" label="Batch of 8 (or more, for sig lanes)" />
+</enum>
+
 <tile name="verify">
     <counter name="TxnResult" enum="VerifyTileResult" summary="Transaction results through verify tile" />
     <counter name="VoteGossipRx" summary="Simple vote transactions received over gossip instead of via the normal TPU path" />
+    <counter name="BatchTxnCnt" enum="VerifyBatchSize" summary="Transactions per FD_BATCH_VERIFY flush" />
+    <counter name="BatchSigCnt" enum="VerifyBatchSize" summary="Signature lanes per FD_BATCH_VERIFY flush (Size8 = 8+)" />
 </tile>
 
 <enum name="DedupTileResult">
